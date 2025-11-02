@@ -1,5 +1,6 @@
 import "./globals.css";
 import type { Metadata } from "next";
+import { Analytics } from "@vercel/analytics/react";
 
 export const metadata: Metadata = {
   title: "Hospital Queue — Step by Step",
@@ -47,6 +48,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   </div>
 </header>
 <main className="max-w-4xl mx-auto">{children}</main>
+<Analytics />
 </body>
 </html>
 );
