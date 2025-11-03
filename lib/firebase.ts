@@ -5,7 +5,9 @@ import {
   onValue,
   update,
   set,
-  runTransaction, 
+  runTransaction,
+  push,
+  remove,
 } from 'firebase/database';
 
 const firebaseConfig = {
@@ -22,4 +24,4 @@ const firebaseConfig = {
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 
 export const db = getDatabase(app);
-export { ref, onValue, update, set, runTransaction }; 
+export { ref, onValue, update, set, runTransaction, push, remove }; 

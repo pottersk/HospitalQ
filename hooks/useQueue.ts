@@ -1,83 +1,38 @@
 'use client';
 
-import { useEffect, useMemo, useState, useCallback } from 'react';
-import { K } from '@/lib/keys';
-import { readInt, writeInt } from '@/lib/storage';
-import { db, ref, onValue, update } from '@/lib/firebase';
-
-type QueueSnapshot = {
-  nextNumber: number;
-  currentNumber: number;
-  lastUpdate?: number;
-  currentStartTime?: number;    // เวลาที่เริ่มตรวจคนปัจจุบัน
-  averageTime?: number;         // เวลาเฉลี่ยต่อคน (milliseconds)
-  notifiedTickets?: number[];   // คิวที่ได้รับการแจ้งเตือนแล้ว
-};
-
-const QPATH = 'queue/global';
-const DEFAULT_AVG_TIME = 15 * 60 * 1000; // 15 minutes in milliseconds
-
-const INITIAL_STATE: QueueSnapshot = {
-  nextNumber: 1,
-  currentNumber: 0,
-  lastUpdate: Date.now(),
-  currentStartTime: Date.now(),
-  averageTime: DEFAULT_AVG_TIME,
-  notifiedTickets: [],
-};
+import { useEffect, useState, useCallback } from 'react';
+import { db, ref, onValue, update, push, set, remove } from '@/lib/firebase';
+import type { Patient } from '@/types';
 
 export function useQueue() {
-  const [queueState, setQueueState] = useState<QueueSnapshot>(INITIAL_STATE);
+  const [patients, setPatients] = useState<Record<string, Patient>>({});
+  const [currentPatient, setCurrentPatient] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(true);
-  const [userTicket, setUserTicket] = useState<number>(0);
 
-  // อ่านค่า ticket จาก localStorage หลัง component mount
+  // ดึงข้อมูลผู้ป่วยทั้งหมด (ทั้ง queue และ history)
   useEffect(() => {
-    const savedTicket = readInt(K.userTicket, 0);
-    if (savedTicket > 0) {
-      setUserTicket(savedTicket);
-    }
-  }, []);
-
-  useEffect(() => {
-    const queueRef = ref(db, QPATH);
+    const queueRef = ref(db, 'queue/patients');
+    const historyRef = ref(db, 'history/patients');
     
-    // เมื่อมีการรีเซ็ตที่ Firebase ให้เคลียร์ค่าในเครื่องด้วย
-    const handleReset = (snapshot: any) => {
-      const data = snapshot.val();
-      if (data?.currentNumber === 0 && data?.nextNumber === 1) {
-        localStorage.removeItem(K.userTicket);
-        setUserTicket(0);
-      }
+    let queueData: Record<string, Patient> = {};
+    let historyData: Record<string, Patient> = {};
+    
+    const updatePatients = () => {
+      setPatients({ ...queueData, ...historyData });
     };
-
-    // เช็คค่าเริ่มต้นเพียงครั้งเดียว
-    const checkOnce = onValue(queueRef, (snapshot) => {
-      if (!snapshot.exists()) {
-        // ถ้ายังไม่มีข้อมูล ค่อยสร้างค่าเริ่มต้น
-        update(queueRef, {
-          ...INITIAL_STATE,
-          lastUpdate: Date.now()
-        });
-      }
-      checkOnce(); // unsubscribe ทันที
-    }, { onlyOnce: true });
-
-    const unsubscribe = onValue(queueRef, (snapshot) => {
-      handleReset(snapshot);
-      const data = snapshot.val() as QueueSnapshot;
-      
-      const validData = {
-        nextNumber: Number.isFinite(data?.nextNumber) ? data.nextNumber : INITIAL_STATE.nextNumber,
-        currentNumber: Number.isFinite(data?.currentNumber) ? data.currentNumber : INITIAL_STATE.currentNumber,
-        lastUpdate: data?.lastUpdate || Date.now(),
-      };
-
-      setQueueState(validData);
+    
+    const queueUnsub = onValue(queueRef, (snapshot) => {
+      queueData = snapshot.val() || {};
+      updatePatients();
       setIsConnected(true);
     }, (error) => {
       console.error('Queue data sync error:', error);
       setIsConnected(false);
+    });
+    
+    const historyUnsub = onValue(historyRef, (snapshot) => {
+      historyData = snapshot.val() || {};
+      updatePatients();
     });
 
     const connectedRef = ref(db, '.info/connected');
@@ -86,140 +41,192 @@ export function useQueue() {
     });
 
     return () => {
-      unsubscribe();
+      queueUnsub();
+      historyUnsub();
       connectedUnsub();
     };
   }, []);
 
+  // ดึงข้อมูลผู้ป่วยปัจจุบัน
   useEffect(() => {
-    if (userTicket > 0) {
-      writeInt(K.userTicket, userTicket);
-    }
-  }, [userTicket]);
-
-  // คำนวณจำนวนคิวที่รออยู่ในระบบ
-  const queueLength = useMemo(
-    () => Math.max(0, queueState.nextNumber - Math.max(queueState.currentNumber, 0) - 1),
-    [queueState.nextNumber, queueState.currentNumber]
-  );
-
-  // คำนวณจำนวนคิวที่ต้องรอสำหรับผู้ใช้
-  const myWaiting = useMemo(
-    () => (userTicket > 0 ? Math.max(0, userTicket - queueState.currentNumber) : 0),
-    [userTicket, queueState.currentNumber]
-  );
-
-  const hasWaitingQueue = useMemo(
-    () => queueState.nextNumber > queueState.currentNumber + 1,
-    [queueState.nextNumber, queueState.currentNumber]
-  );
-
-  const setNextNumber = useCallback(async (n: number) => {
-    const queueRef = ref(db, QPATH);
-    return update(queueRef, { 
-      nextNumber: n,
-      lastUpdate: Date.now()
+    const currentRef = ref(db, 'queue/current');
+    const unsubscribe = onValue(currentRef, (snapshot) => {
+      setCurrentPatient(snapshot.val());
     });
+
+    return () => unsubscribe();
   }, []);
 
-  // ตรวจสอบว่าคิวถูกยกเลิกหรือไม่
-  const checkIfTicketCancelled = useCallback(async (ticketNumber: number) => {
-    const cancelledRef = ref(db, `queue/cancelled/${ticketNumber}`);
-    return new Promise((resolve) => {
-      onValue(cancelledRef, (snapshot) => {
-        resolve(snapshot.exists());
-      }, { onlyOnce: true });
-    });
+  // เพิ่มผู้ป่วยใหม่
+  const addPatient = useCallback(async (name: string, hn?: string, doctors?: string[], note?: string): Promise<string> => {
+    const patientsRef = ref(db, 'queue/patients');
+    const newPatient: Partial<Patient> = {
+      id: Date.now(),
+      name,
+      status: 'waiting',
+      timestamp: Date.now()
+    };
+    
+    // เพิ่ม hn เฉพาะเมื่อมีค่า
+    if (hn) {
+      newPatient.hn = hn;
+    }
+    
+    // เพิ่ม doctors เฉพาะเมื่อมีค่า
+    if (doctors && doctors.length > 0) {
+      newPatient.doctors = doctors;
+    }
+    
+    // เพิ่ม note เฉพาะเมื่อมีค่า
+    if (note) {
+      newPatient.note = note;
+    }
+    
+    const newPatientRef = await push(patientsRef, newPatient);
+    return newPatientRef.key || '';
   }, []);
 
-  const setCurrentNumber = useCallback(async (n: number) => {
-    // ตรวจสอบว่าคิวถูกยกเลิกหรือไม่
-    const isCancelled = await checkIfTicketCancelled(n);
-    if (isCancelled) {
-      // ถ้าคิวถูกยกเลิก ให้ข้ามไปคิวถัดไป
-      const nextTicket = n + 1;
-      console.log(`Ticket ${n} was cancelled, skipping to ${nextTicket}`);
-      const queueRef = ref(db, QPATH);
-      return update(queueRef, {
-        currentNumber: nextTicket,
-        lastUpdate: Date.now(),
-        currentStartTime: Date.now()
-      });
-    }
+  // เรียกผู้ป่วยคนถัดไป
+  const callNextPatient = useCallback(async () => {
+    // หาผู้ป่วยที่รออยู่คนแรก
+    const waitingPatients = Object.entries(patients)
+      .filter(([_, p]) => p.status === 'waiting')
+      .sort((a, b) => a[1].timestamp - b[1].timestamp);
 
-    const queueRef = ref(db, QPATH);
-    return update(queueRef, { 
-      currentNumber: n,
-      lastUpdate: Date.now(),
-      currentStartTime: Date.now()
+    if (waitingPatients.length === 0) return;
+
+    const [patientId, patient] = waitingPatients[0];
+    
+    // อัพเดตสถานะผู้ป่วย
+    await update(ref(db, `queue/patients/${patientId}`), {
+      status: 'in-progress',
+      startTime: Date.now()
     });
-  }, [checkIfTicketCancelled]);
 
-  // คำนวณเวลาที่ใช้ไปในการตรวจคนปัจจุบัน
-  const currentExamTime = useMemo(() => {
-    if (!queueState.currentStartTime) return 0;
-    return Date.now() - queueState.currentStartTime;
-  }, [queueState.currentStartTime]);
+    // อัพเดตผู้ป่วยปัจจุบัน
+    await set(ref(db, 'queue/current'), patientId);
+  }, [patients]);
 
-  // คำนวณเวลาที่คาดว่าจะรอ
-  const estimatedWaitTime = useMemo(() => {
-    if (myWaiting <= 0) return 0;
-    const averageTime = queueState.averageTime || DEFAULT_AVG_TIME;
-    return myWaiting * averageTime;
-  }, [myWaiting, queueState.averageTime]);
+  // เสร็จสิ้นการตรวจ
+  const completeCurrentPatient = useCallback(async () => {
+    if (!currentPatient) return;
 
-  // ตรวจสอบว่าควรแจ้งเตือนหรือไม่
-  useEffect(() => {
-    const checkAndNotify = async () => {
-      if (!userTicket) return;
+    const patientData = patients[currentPatient];
+    if (!patientData) return;
 
-      if (myWaiting <= 3 && myWaiting > 0) {
-        // แจ้งเตือนเมื่อใกล้ถึงคิว
-        const notified = queueState.notifiedTickets?.includes(userTicket);
-        if (!notified && 'Notification' in window) {
-          const permission = await Notification.requestPermission();
-          if (permission === 'granted') {
-            new Notification('เตรียมตัวพบแพทย์', {
-              body: `อีก ${myWaiting} คิว จะถึงคิวของคุณ`,
-              icon: '/icon.png'
-            });
-            // บันทึกว่าได้แจ้งเตือนคิวนี้แล้ว
-            const queueRef = ref(db, QPATH);
-            update(queueRef, {
-              notifiedTickets: [...(queueState.notifiedTickets || []), userTicket]
-            });
-          }
-        }
-      } else if (userTicket === queueState.currentNumber) {
-        // แจ้งเตือนเมื่อถึงคิว
-        if ('Notification' in window) {
-          const permission = await Notification.requestPermission();
-          if (permission === 'granted') {
-            new Notification('ถึงคิวของคุณแล้ว!', {
-              body: 'กรุณาเข้าพบแพทย์ที่ห้องตรวจ',
-              icon: '/icon.png',
-              requireInteraction: true // การแจ้งเตือนจะไม่หายไปจนกว่าจะกดปิด
-            });
-          }
-        }
-      }
+    // อัปเดตสถานะเป็น completed และบันทึก endTime
+    const completedData = {
+      ...patientData,
+      status: 'completed' as const,
+      endTime: Date.now()
     };
 
-    checkAndNotify();
-  }, [myWaiting, userTicket, queueState.notifiedTickets]);
+    // บันทึกข้อมูลไปที่ history (เพื่อแสดงในตารางว่าเสร็จสิ้น)
+    await set(ref(db, `history/patients/${currentPatient}`), completedData);
+
+    // ลบออกจาก queue/patients (ทำให้ link หมดอายุ)
+    await remove(ref(db, `queue/patients/${currentPatient}`));
+
+    // ลบผู้ป่วยปัจจุบัน
+    await set(ref(db, 'queue/current'), null);
+  }, [currentPatient, patients]);
+
+  // ยกเลิกคิว
+  const cancelPatient = useCallback(async (patientId: string) => {
+    await update(ref(db, `queue/patients/${patientId}`), {
+      status: 'cancelled',
+      endTime: Date.now()
+    });
+
+    if (currentPatient === patientId) {
+      await set(ref(db, 'queue/current'), null);
+    }
+  }, [currentPatient]);
+
+  // ข้ามผู้ป่วยปัจจุบัน
+  const skipCurrentPatient = useCallback(async () => {
+    if (!currentPatient) return;
+    
+    // ย้ายผู้ป่วยกลับไปรอ
+    await update(ref(db, `queue/patients/${currentPatient}`), {
+      status: 'waiting',
+      startTime: null
+    });
+
+    // ลบผู้ป่วยปัจจุบัน
+    await set(ref(db, 'queue/current'), null);
+  }, [currentPatient]);
+
+  // แก้ไขข้อมูลผู้ป่วย
+  const updatePatient = useCallback(async (patientId: string, name: string, hn?: string, doctors?: string[], note?: string) => {
+    const updates: Partial<Patient> = {
+      name,
+      hn: hn || undefined,
+      doctors: doctors && doctors.length > 0 ? doctors : undefined
+    };
+    
+    if (note) {
+      updates.note = note;
+    }
+    
+    await update(ref(db, `queue/patients/${patientId}`), updates);
+  }, []);
+
+  // ลบผู้ป่วยออกจากระบบ
+  const deletePatient = useCallback(async (patientId: string) => {
+    // ลบทั้งจาก queue และ history
+    await remove(ref(db, `queue/patients/${patientId}`));
+    await remove(ref(db, `history/patients/${patientId}`));
+    
+    if (currentPatient === patientId) {
+      await set(ref(db, 'queue/current'), null);
+    }
+  }, [currentPatient]);
+
+  // จำนวนผู้ป่วยที่รออยู่
+  const waitingCount = Object.values(patients).filter(p => p.status === 'waiting').length;
+
+  // ข้อมูลผู้ป่วยปัจจุบัน
+  const currentPatientData = currentPatient ? patients[currentPatient] : null;
+
+  // เวลาที่ใช้ในการตรวจปัจจุบัน (ถ้ามี)
+  const currentExamTime = currentPatientData?.startTime
+    ? Date.now() - currentPatientData.startTime
+    : 0;
+
+  // เรียงลำดับผู้ป่วยตามสถานะและเวลา
+  const sortedPatients = Object.entries(patients)
+    .map(([firebaseId, patient]) => ({
+      firebaseId,
+      ...patient
+    }))
+    .sort((a, b) => {
+      // เรียงตามสถานะ
+      const statusOrder = {
+        'in-progress': 0,
+        'waiting': 1,
+        'completed': 2,
+        'cancelled': 3
+      };
+      const statusDiff = statusOrder[a.status] - statusOrder[b.status];
+      if (statusDiff !== 0) return statusDiff;
+      
+      // ถ้าสถานะเดียวกัน เรียงจากเก่าไปใหม่ (ที่มาก่อนขึ้นก่อน)
+      return a.timestamp - b.timestamp;
+    });
 
   return {
-    nextNumber: queueState.nextNumber,
-    currentNumber: queueState.currentNumber,
-    setNextNumber,
-    setCurrentNumber,
-    userTicket,
-    setUserTicket,
-    queueLength,
-    myWaiting,
+    patients: sortedPatients,
+    currentPatient: currentPatientData,
+    waitingCount,
+    currentExamTime,
     isConnected,
-    hasWaitingQueue,
-    currentExamTime,        // เวลาที่ใช้ในการตรวจคนปัจจุบัน
-    estimatedWaitTime,     // เวลาที่คาดว่าจะต้องรอ
+    addPatient,
+    callNextPatient,
+    completeCurrentPatient,
+    cancelPatient,
+    skipCurrentPatient,
+    updatePatient,
+    deletePatient,
   } as const;
 }
